@@ -1,0 +1,6 @@
+airflow/astro-project/.env
+airflow/astro-project/.venv/
+airflow/astro-project/logs/
+airflow/astro-project/**/__pycache__/
+airflow/astro-project/**/*.pyc
+airflow/astro-project/.pytest_cache/
