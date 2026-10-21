@@ -67,7 +67,7 @@ with DAG(
     dag_id="cold_chain_incremental_pipeline",
     description="Triggers the incremental cold-chain Databricks Job",
     start_date=datetime(2026, 10, 21, tzinfo=timezone.utc),
-    schedule=None,
+    schedule="0 */12 * * *",
     catchup=False,
     max_active_runs=1,
     default_args={"owner": "team-2", "retries": 0},
