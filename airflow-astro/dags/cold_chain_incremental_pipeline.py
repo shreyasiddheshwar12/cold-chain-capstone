@@ -20,6 +20,72 @@ NEW_RELIC_ENDPOINTS = {
     "JP": "https://insights-collector.jp.nr-data.net/v1/accounts/events",
 }
 
+# Airflow task name : exact Databricks task key
+# Replace values marked REPLACE with your actual Databricks task keys.
+DATABRICKS_TASK_KEYS = {
+    "generate_data": "REPLACE_GENERATOR_TASK_KEY",
+    "bronze": "Bronze",
+    "silver_validation": "Silver_validation",
+    "silver_reference": "Silver_Reference",
+    "gold": "Gold",
+    "operational_readiness": "REPLACE_OPERATIONAL_TASK_KEY",
+    "new_relic": "REPLACE_NEW_RELIC_TASK_KEY",
+}
+
+POLL_SECONDS = 20
+TERMINAL_STATES = {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}
+
+
+def databricks_headers():
+    assert DATABRICKS_HOST, "DATABRICKS_HOST is missing"
+    assert DATABRICKS_TOKEN, "DATABRICKS_TOKEN is missing"
+    return {"Authorization": f"Bearer {DATABRICKS_TOKEN}"}
+
+
+def get_run(run_id):
+    response = requests.get(
+        f"{DATABRICKS_HOST}/api/2.1/jobs/runs/get",
+        headers=databricks_headers(),
+        params={"run_id": run_id},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def wait_for_databricks_task(run_id, task_key):
+    """Waits for one task inside the Databricks Job run."""
+    while True:
+        run = get_run(run_id)
+
+        matches = [
+            t for t in run.get("tasks", [])
+            if t.get("task_key") == task_key
+        ]
+        assert matches, (
+            f"Task key '{task_key}' not found in Databricks run {run_id}. "
+            "Check DATABRICKS_TASK_KEYS."
+        )
+
+        state = matches[-1].get("state", {})
+        life_cycle = state.get("life_cycle_state")
+        result = state.get("result_state")
+
+        print(f"{task_key}: life_cycle={life_cycle}, result={result}")
+
+        if life_cycle in TERMINAL_STATES:
+            if result != "SUCCESS":
+                raise RuntimeError(
+                    f"Databricks task {task_key} ended with {result}: "
+                    f"{state.get('state_message', '')}"
+                )
+            return task_key
+
+        if run.get("state", {}).get("life_cycle_state") in TERMINAL_STATES and life_cycle is None:
+            raise RuntimeError(f"Databricks task {task_key} never started.")
+
+        time.sleep(POLL_SECONDS)
+
 
 def publish_airflow_event(context, status):
     if not NEW_RELIC_LICENSE_KEY:
@@ -65,7 +131,7 @@ def notify_failure(context):
 
 with DAG(
     dag_id="cold_chain_incremental_pipeline",
-    description="Triggers the incremental cold-chain Databricks Job",
+    description="Triggers and tracks each stage of the incremental Databricks Job",
     start_date=datetime(2026, 10, 21, tzinfo=timezone.utc),
     schedule="0 */12 * * *",
     catchup=False,
@@ -74,50 +140,66 @@ with DAG(
     tags=["cold-chain", "incremental", "databricks", "new-relic"],
 ) as dag:
 
-    @task(
-        on_success_callback=notify_success,
-        on_failure_callback=notify_failure,
-    )
-    def run_incremental_databricks_job():
-        assert DATABRICKS_HOST, "DATABRICKS_HOST is missing"
-        assert DATABRICKS_TOKEN, "DATABRICKS_TOKEN is missing"
+    @task
+    def trigger_databricks_job():
         assert DATABRICKS_JOB_ID, "DATABRICKS_INCREMENTAL_JOB_ID is missing"
 
-        headers = {"Authorization": f"Bearer {DATABRICKS_TOKEN}"}
-
-        start = requests.post(
+        response = requests.post(
             f"{DATABRICKS_HOST}/api/2.1/jobs/run-now",
-            headers=headers,
+            headers=databricks_headers(),
             json={"job_id": int(DATABRICKS_JOB_ID)},
             timeout=60,
         )
-        start.raise_for_status()
-        run_id = start.json()["run_id"]
+        response.raise_for_status()
+        run_id = response.json()["run_id"]
         print("Databricks run started:", run_id)
+        return run_id
 
+    def make_stage_task(airflow_task_id, databricks_task_key, trigger_rule="all_success"):
+        @task(task_id=airflow_task_id, trigger_rule=trigger_rule)
+        def stage(run_id):
+            return wait_for_databricks_task(run_id, databricks_task_key)
+        return stage
+
+    @task(
+        trigger_rule="all_done",
+        on_success_callback=notify_success,
+        on_failure_callback=notify_failure,
+    )
+    def finalize_pipeline(run_id):
+        """Waits for the whole Databricks run and reports the final result."""
         while True:
-            time.sleep(30)
-
-            status = requests.get(
-                f"{DATABRICKS_HOST}/api/2.1/jobs/runs/get",
-                headers=headers,
-                params={"run_id": run_id},
-                timeout=60,
-            )
-            status.raise_for_status()
-            state = status.json()["state"]
-
+            state = get_run(run_id).get("state", {})
             life_cycle = state.get("life_cycle_state")
             result = state.get("result_state")
-            print("Life cycle:", life_cycle, "| Result:", result)
+            print("Job:", life_cycle, result)
 
-            if life_cycle in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR"):
+            if life_cycle in TERMINAL_STATES:
                 if result != "SUCCESS":
                     raise RuntimeError(
                         f"Databricks run {run_id} ended with {result}: "
                         f"{state.get('state_message', '')}"
                     )
-                print("Databricks run succeeded:", run_id)
                 return run_id
 
-    run_incremental_databricks_job()
+            time.sleep(POLL_SECONDS)
+
+    run_id = trigger_databricks_job()
+
+    generate = make_stage_task("generate_data", DATABRICKS_TASK_KEYS["generate_data"])(run_id)
+    bronze = make_stage_task("bronze", DATABRICKS_TASK_KEYS["bronze"])(run_id)
+    silver_val = make_stage_task("silver_validation", DATABRICKS_TASK_KEYS["silver_validation"])(run_id)
+    silver_ref = make_stage_task("silver_reference", DATABRICKS_TASK_KEYS["silver_reference"])(run_id)
+    gold = make_stage_task("gold", DATABRICKS_TASK_KEYS["gold"])(run_id)
+    operational = make_stage_task("operational_readiness", DATABRICKS_TASK_KEYS["operational_readiness"])(run_id)
+
+    # New Relic runs in Databricks with "All done", so track it even if earlier stages fail.
+    new_relic = make_stage_task(
+        "new_relic",
+        DATABRICKS_TASK_KEYS["new_relic"],
+        trigger_rule="all_done",
+    )(run_id)
+
+    final = finalize_pipeline(run_id)
+
+    generate >> bronze >> silver_val >> silver_ref >> gold >> operational >> new_relic >> final
